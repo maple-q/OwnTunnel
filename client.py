@@ -1,15 +1,15 @@
 #! /usr/bin/python
 # coding: utf-8
-from server.server import Server
+from client.client import Client
 
 
 VERSION = 'v0.2'
 
 
 def main():
-    server = Server()
+    client = Client()
     try:
-        server.start()
+        client.start()
     except (KeyboardInterrupt, IOError):
         print('[INFO] Exit now...')
         return

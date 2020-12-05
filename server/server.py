@@ -1,11 +1,17 @@
 #! /usr/bin/python
 # coding: utf-8
+import random
 import sys
 import socket
+import time
 import threading
 
-from io_handle.params import ParamsParser
+from collections import deque
+
+from io_handle.server_params import ParamsParser
 from verify.verify import ParamsVerify
+from constant.constant import Constant
+from logs.logs import Log
 
 
 class Server(object):
@@ -28,112 +34,161 @@ class Server(object):
         # 通过端口检验，即可获取两个监听端口
         self.__listen_port = int(self.__params['listen_port'])
         self.__trans_port = int(self.__params['trans_port'])
+        # 日志等级
+        self.__log_opened = self.__params['detail_log']
+        self.__log_obj = Log(self.__log_opened)
 
         # socket 已完成握手的最大队列数量
         self.__max_queue_nums = 5
 
-        # 两个列表，一个存放连接trans口的客户端，一个存放连接listen口的客户端
-        self.__trans_client = list()
-        # [(socket1, addr1), (socket2, addr2)]
-        # [(socket3, addr3), (socket4, addr4)]
-        # 此时socket1和socket3通信，socket2和socket4通信，如果两个列表长度不相等，则多出来的socket发送的数据将被丢弃
-        self.__listen_client = list()
-
-        # 互斥锁，往列表中添加client时需要加锁，消费client也需要加锁
-        self.__mutex = threading.Semaphore(1)
         # TCP接受缓冲区大小
-        self.__read_buffer_size = 4 * 1024
+        self.__read_buffer_size = 1 * 1024
+
+        self.__OWN_TUNNEL_CLIENT = 'own_tunnel_client'
+        self.__USER_CLIENT = 'user_client'
 
     def start(self):
-        print('[INFO] Server starting now...')
-        print('[INFO] Listen Port: {listen_port}, Trans Port: {trans_port}'.format(listen_port=self.__listen_port,
-                                                                                   trans_port=self.__trans_port))
+        self.__log_obj.log(Constant.INFO, 'Starting Server now...')
 
-        # 开启两个线程，分别监听两个端口
-        trans_thread = threading.Thread(target=self.listen, args=(self.__trans_port, self.__trans_client))
-        listen_thread = threading.Thread(target=self.listen, args=(self.__listen_port, self.__listen_client))
-        # 再开启以下线程，循环读取两个列表相应位置上的套接字，并创建线程在其之间传递数据
-        consumer_thread = threading.Thread(target=self.consumer)
+        # 先监听和Own Tunnel连接的端口，再监听和用户端连接端口
+        while True:
+            connections_queue = deque(maxlen=2)
 
-        trans_thread.start()
-        listen_thread.start()
-        consumer_thread.start()
-        # 主线程等待
-        trans_thread.join()
-        listen_thread.join()
-        consumer_thread.join()
+            thread1 = threading.Thread(target=self.listen_tunnel, args=(connections_queue, ))
+            thread1.setDaemon(True)
 
-    def listen(self, port, client_collection):
+            thread2 = threading.Thread(target=self.listen_user_port, args=(connections_queue, ))
+            thread2.setDaemon(True)
+
+            thread2.start()
+            thread1.start()
+
+            while True:
+                if len(connections_queue) != 2:
+                    continue
+                else:
+                    break
+
+            # 从队列取出两个套接字
+            own_tunnel_client_socket, user_client_socket = None, None
+            for connections in connections_queue:
+                if self.__OWN_TUNNEL_CLIENT == connections.keys()[0]:
+                    own_tunnel_client_socket = connections[connections.keys()[0]]
+
+                if self.__USER_CLIENT == connections.keys()[0]:
+                    user_client_socket = connections[connections.keys()[0]]
+
+            # 开启两个线程执行转发
+            own_client_to_user_thread = threading.Thread(target=self.forward_from_own_client_to_user,
+                                                         args=(own_tunnel_client_socket, user_client_socket))
+            own_client_to_user_thread.setDaemon(True)
+
+            user_to_own_client_thread = threading.Thread(target=self.forward_from_user_to_own_client,
+                                                         args=(user_client_socket, own_tunnel_client_socket))
+            user_to_own_client_thread.setDaemon(True)
+
+            own_client_to_user_thread.start()
+            user_to_own_client_thread.start()
+
+    def listen_tunnel(self, connections_queue):
         """
-        监听端口，等待客户端连接
-        :param port: 需要监听的端口
-        :param client_collection: 一旦有客户端连接，则将其加入到列表中
+        监听和OwnTunnel通信的端口
+        :param connections_queue:
         :return:
         """
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # TODO 禁用Nagle算法 需要测试禁用之后是否还存在粘包问题
-        server_socket.bind((self.__listen_host, port))
-        server_socket.listen(self.__max_queue_nums)
+        own_tunnel_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        own_tunnel_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-        # 开启等待
         while True:
-            remote_socket, remote_addr = server_socket.accept()
-            print('===========================================')
-            print('[INFO] Client: {remote_ip}: {remote_port} connected.'.format(remote_ip=remote_addr[0],
-                                                                                remote_port=remote_addr[1]))
+            try:
+                own_tunnel_socket.bind((self.__listen_host, self.__listen_port))
+            except socket.error:
+                self.__log_obj.log(Constant.INFO, 'binding {}:{} failed, please check the port has been listened.'
+                                   .format(self.__listen_host, self.__listen_port))
+                time.sleep(random.randint(1, 3))
+                continue
 
-            # TODO 这里很纠结呀，两个端口同时监听，如果两个端口各自有1个客户端连接，那直接转发数据就可以了
-            # TODO 但是，如果两个端口都不止一个客户端连接，怎么处理？
-            # TODO 能不能用数据结构来进行维护，先尝试用两个列表来进行维护
-            self.__mutex.acquire()
-            client_collection.append((remote_socket, remote_addr))
-            self.__mutex.release()
+            own_tunnel_socket.listen(self.__max_queue_nums)
+            self.__log_obj.log(Constant.INFO, 'Server Listen at {}:{} now...'.format(self.__listen_host,
+                                                                                     self.__listen_port))
 
-    def consumer(self):
+            # 开启监听
+            own_tunnel_client_socket, own_tunnel_client_addr = own_tunnel_socket.accept()
+            self.__log_obj.log(Constant.INFO, 'client {}:{} connected.'.format(own_tunnel_client_addr[0],
+                                                                               own_tunnel_client_addr[1]))
+
+            connections_queue.append({self.__OWN_TUNNEL_CLIENT: own_tunnel_client_socket})
+            break
+
+    def listen_user_port(self, connections_queue):
         """
-        消费者进程，读取存放了多个客户端的列表，从中取出相对应位置上的
+        监听和user端通信的端口
+        :param connections_queue:
         :return:
         """
+        user_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        user_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         while True:
-            # 这里消费需要加锁，如果不加锁，在长度判断之后，其他线程可能会写入列表，导致当前线程后续执行出错
-            self.__mutex.acquire()
+            try:
+                user_socket.bind((self.__listen_host, self.__trans_port))
+            except socket.error:
+                self.__log_obj.log(Constant.INFO, 'binding {}:{} failed, please check the port has been listened.'
+                                   .format(self.__listen_host, self.__trans_port))
+                time.sleep(random.randint(1, 3))
+                continue
 
-            trans_client_length = len(self.__trans_client)
-            listen_client_length = len(self.__listen_client)
+            user_socket.listen(self.__max_queue_nums)
+            self.__log_obj.log(Constant.INFO, 'Server Listen at {}:{} now...'.format(self.__listen_host,
+                                                                                     self.__trans_port))
 
-            if trans_client_length != 0 and trans_client_length == listen_client_length:
-                for trans_client, listen_client in zip(self.__trans_client, self.__listen_client):
-                    print('[INFO] trans data from {} to {}'.format(trans_client[1], listen_client[1]))
-                    threading.Thread(target=self.forward, args=(trans_client, listen_client)).start()
+            # 开启监听
+            user_client_socket, user_client_addr = user_socket.accept()
 
-                    print('[INFO] trans data from {} to {}'.format(listen_client[1], listen_client[1]))
-                    threading.Thread(target=self.forward, args=(listen_client, trans_client)).start()
+            connections_queue.append({self.__USER_CLIENT: user_client_socket})
+            break
 
-                self.__trans_client.clear()
-                self.__listen_client.clear()
-
-            # 释放锁
-            self.__mutex.release()
-
-    def forward(self, socket_to_read, socket_to_write):
+    def forward_from_own_client_to_user(self, own_tunnel_client_socket, user_socket):
         """
-        从socket_to_read中读取内容，转发到socket_to_write
-        :param socket_to_read: 读socket
-        :param socket_to_write: 写socket
+        读own_tunnel_client，写user_socket
+        :param own_tunnel_client_socket:
+        :param user_socket:
+        :return:
+        """
+        # TODO 从OwnTunnel Client发送的数据后续加密，这里将两个函数拆分主要为了后续考虑
+        while True:
+            try:
+                read_data = own_tunnel_client_socket.recv(self.__read_buffer_size)
+            except socket.error:
+                break
+
+            # 没有data可读，则线程结束
+            if not read_data:
+                break
+
+            try:
+                user_socket.send(read_data)
+            except socket.error:
+                break
+
+    def forward_from_user_to_own_client(self, user_socket, own_tunnel_client_socket):
+        """
+        读user_socket，写own_tunnel_client_socket
+        :param user_socket:
+        :param own_tunnel_client_socket:
         :return:
         """
         while True:
             try:
-                # TODO 从socket读取时，缓冲区大小设置为多少？
-                read_data = socket_to_read[0].recv(self.__read_buffer_size)
+                read_data = user_socket.recv(self.__read_buffer_size)
+            except socket.error:
+                break
 
-                socket_to_write[0].send(read_data)
-            except (ConnectionAbortedError, ConnectionResetError):
-                # 读取客户端输入时，客户端可能直接断开连接了
-                print('===========================================')
-                print('[ERROR] read data from {} to {} failed'.format(socket_to_read[1], socket_to_write[1]))
-                print('[ERROR] remote host may be reset the connection.')
-                print('===========================================')
-                # 由于一方已经关闭连接，另一方也主动断开连接
-                socket_to_write[0].close()
+            # 没有data可读，则线程结束
+            if not read_data:
+                break
+
+            try:
+                own_tunnel_client_socket.send(read_data)
+            except socket.error:
                 break
